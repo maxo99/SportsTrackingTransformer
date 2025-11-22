@@ -23,7 +23,7 @@ torch.set_float32_matmul_precision("medium")
 
 class SportsTransformer(nn.Module):
     """
-    Transformer model architecture for processing sports tracking data.
+    Transformer model that treats all 22 players as a sequence for tackle prediction.
     """
 
     def __init__(
@@ -140,12 +140,15 @@ class TheZooArchitecture(nn.Module):
     TheZooArchitecture represents a baseline model to compare against the SportsTransformer.
     It was the winning solution for the 2020 Big Data Bowl designed to predict run game yardage gained with an
     innovative (at the time) approach to solving player-equivariance problem. At a high level, the approach requires
-    generating a set of interaction vectors between each pair of players, applying feedforward layers to each
+    generating a set of pairwise interaction vectors between offense (10) and defense (11) players, applying feedforward layers to each
     interaction embedding independently, and then pooling across interaction dimensions to get to a final output.
 
-    Zoo Model code based on:
-    https://github.com/juancamilocampos/nfl-big-data-bowl-2020/blob/master/1st_place_zoo_solution_v2.ipynb
+    Based on: https://github.com/juancamilocampos/nfl-big-data-bowl-2020/blob/master/1st_place_zoo_solution_v2.ipynb
     """
+
+    # 10 offensive players and 11 defensive players
+    NUM_OFFENSE = 10
+    NUM_DEFENSE = 11
 
     def __init__(
         self,
@@ -224,6 +227,13 @@ class TheZooArchitecture(nn.Module):
             )
         )
 
+        # Pooling layers for collapsing offensive and defensive dimensions
+        # Created in __init__ (not forward()) so fvcore can trace FLOPs
+        self.pool_offense_max = nn.MaxPool2d((1, self.NUM_OFFENSE))
+        self.pool_offense_avg = nn.AvgPool2d((1, self.NUM_OFFENSE))
+        self.pool_defense_max = nn.MaxPool1d(self.NUM_DEFENSE)
+        self.pool_defense_avg = nn.AvgPool1d(self.NUM_DEFENSE)
+
     def forward(self, x: Tensor) -> Tensor:
         """
         Forward pass of the TheZooArchitecture.
@@ -244,12 +254,13 @@ class TheZooArchitecture(nn.Module):
 
         # apply first block, pool and collapse offensive dimension
         x = self.ff_block1(x.permute(0, 3, 2, 1))  # [B,O,D,M] -> [B,M,D,O]
-        x = nn.MaxPool2d((1, O))(x) * 0.3 + nn.AvgPool2d((1, O))(x) * 0.7  # [B,M,D,O] -> [B,M,D,1]
+        # Zoo Authors mentioned using a weighted sum of max and avg pooling helped most (experimentally verified hparam)
+        x = self.pool_offense_max(x) * 0.3 + self.pool_offense_avg(x) * 0.7  # [B,M,D,O] -> [B,M,D,1]
         x = x.squeeze(-1)  # [B,M,D,1] -> [B,M,D]
 
         # apply second block, pool and collapse defensive dimension
         x = self.ff_block2(x)  # [B,M,D] -> [B,M,D]
-        x = nn.MaxPool1d(D)(x) * 0.3 + nn.AvgPool1d(D)(x) * 0.7  # [B,M,D] -> [B,M,1]
+        x = self.pool_defense_max(x) * 0.3 + self.pool_defense_avg(x) * 0.7  # [B,M,D] -> [B,M,1]
         x = x.squeeze(-1)  # [B,M,1] -> [B,M]
 
         # apply decoder
@@ -287,8 +298,13 @@ class LitModel(LightningModule):
         self.model_type = model_type.lower()
         self.model_class = SportsTransformer if self.model_type == "transformer" else TheZooArchitecture
         self.feature_len = 6 if self.model_type == "transformer" else 10
+
+        # Initialize model with architecture-specific parameters
         self.model = self.model_class(
-            feature_len=self.feature_len, model_dim=model_dim, num_layers=num_layers, dropout=dropout
+            feature_len=self.feature_len,
+            model_dim=model_dim,
+            num_layers=num_layers,
+            dropout=dropout,
         )
         self.example_input_array = (
             torch.randn((batch_size, 22, self.feature_len))

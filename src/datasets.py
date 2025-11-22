@@ -1,21 +1,34 @@
 """
 Dataset Module for NFL Big Data Bowl 2024
 
-This module defines the BDB2024_Dataset class, which is used to load and preprocess
-data for training machine learning models. It includes functionality for both
-'transformer' and 'zoo' model types.
+This module handles data loading and preprocessing for tackle prediction models.
+It implements two distinct feature engineering approaches:
+
+1. Transformer Model: Minimal feature engineering, providing raw player features
+   to leverage self-attention for learning spatial relationships end-to-end.
+
+2. Zoo Model: Complex pairwise feature engineering creating a 10x11 grid of
+   offensive-defensive player interactions, following the architecture that won
+   the 2020 NFL Big Data Bowl.
+
+The key insight is that Transformer models can learn these interaction patterns
+automatically, while Zoo models require manual feature engineering.
 
 Classes:
-    BDB2024_Dataset: Custom dataset class for NFL tracking data
+    BDB2024_Dataset: Custom PyTorch dataset class for NFL tracking data
 
 Functions:
-    load_datasets: Load preprocessed datasets for a specific model type and data split
-    main: Main execution function for creating and saving datasets
+    load_datasets: Load preprocessed datasets from disk
+    main: Precompute and cache datasets for all splits and model types
 
+Usage:
+    dataset = load_datasets('transformer', 'train')
+    features, targets = dataset[0]  # Get first sample
 """
 
 import multiprocessing as mp
 import pickle
+import random
 import time
 from pathlib import Path
 
@@ -24,6 +37,10 @@ import pandas as pd
 import polars as pl
 from torch.utils.data import Dataset
 from tqdm import tqdm
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+random.seed(42)
 
 PREPPED_DATA_DIR = Path("data/split_prepped_data/")
 DATASET_DIR = Path("data/datasets/")
@@ -66,7 +83,8 @@ class BDB2024_Dataset(Dataset):
             raise ValueError("model_type must be either 'transformer' or 'zoo'")
 
         self.model_type = model_type
-        self.keys = list(feature_df.select(["gameId", "playId", "mirrored", "frameId"]).unique().rows())
+        # Sort keys to ensure deterministic ordering across runs
+        self.keys = sorted(feature_df.select(["gameId", "playId", "mirrored", "frameId"]).unique().rows())
 
         # Convert to pandas form with index for quick row retrieval
         self.feature_df_partition = (
@@ -81,6 +99,7 @@ class BDB2024_Dataset(Dataset):
         )
 
         # Precompute features and store in dicts
+        # Note: Using pool.map() preserves input order, ensuring deterministic dictionary construction
         self.tgt_arrays: dict[tuple, np.ndarray] = {}
         self.feature_arrays: dict[tuple, np.ndarray] = {}
         with mp.Pool(processes=min(8, mp.cpu_count())) as pool:
@@ -88,7 +107,7 @@ class BDB2024_Dataset(Dataset):
                 self.process_key,
                 tqdm(self.keys, desc="Pre-computing feature transforms", total=len(self.keys)),
             )
-            # Unpack results
+            # Unpack results in the same order as self.keys (pool.map guarantees order)
             for key, tgt_array, feature_array in results:
                 self.tgt_arrays[key] = tgt_array
                 self.feature_arrays[key] = feature_array
@@ -184,6 +203,20 @@ class BDB2024_Dataset(Dataset):
         Raises:
             AssertionError: If the output shape is not as expected
         """
+        # Features fed to the Transformer model (per player):
+        # - x_rel, y_rel: Player position relative to ball carrier (in yards)
+        #                 Using relative positions makes the model learn spatial relationships
+        #                 (e.g., "defender 5 yards ahead") rather than absolute field positions
+        # - vx, vy: Player velocity in x and y directions (yards/second)
+        #           Velocity helps predict where players will be, not just where they are now
+        # - side: Offensive (+1) or Defensive (-1) team indicator
+        #         Helps model learn different roles (e.g., blockers vs. tacklers)
+        # - is_ball_carrier: Binary flag (1 = has ball, 0 = doesn't)
+        #                    Critical for identifying the target player being tackled
+        #
+        # Shape: (22 players, 6 features)
+        # The Transformer's self-attention mechanism will learn to focus on relevant players
+        # (e.g., nearby defenders, blocking assignments) automatically during training.
         features = ["x_rel", "y_rel", "vx", "vy", "side", "is_ball_carrier"]
         x = frame_df[features].to_numpy(dtype=np.float32)
         assert x.shape == (22, len(features)), f"Expected shape (22, {len(features)}), got {x.shape}"
@@ -237,6 +270,26 @@ class BDB2024_Dataset(Dataset):
             axis=-1,
         )
 
+        # Zoo Architecture expects shape: (10 offensive players, 11 defensive players, 10 interaction features)
+        #
+        # This creates a grid where each cell [i, j] represents the interaction between
+        # offensive player i and defensive player j:
+        #
+        #           Defender 1    Defender 2    ...    Defender 11
+        # Offense 1  [10 feats]    [10 feats]    ...    [10 feats]
+        # Offense 2  [10 feats]    [10 feats]    ...    [10 feats]
+        #   ...         ...           ...        ...       ...
+        # Offense 10 [10 feats]    [10 feats]    ...    [10 feats]
+        #
+        # The 10 features per interaction include:
+        # - Defensive player velocity (2 features: vx, vy)
+        # - Relative position: defender - ball carrier (2 features: dx, dy)
+        # - Relative velocity: defender - ball carrier (2 features: dvx, dvy)
+        # - Relative position: offensive blocker - defender (2 features: dx, dy)
+        # - Relative velocity: offensive blocker - defender (2 features: dvx, dvy)
+        #
+        # This grid structure allows the Zoo model to learn pairwise offensive-defensive interactions,
+        # but limits its ability to see complex multi-player patterns (e.g., 3 defenders converging).
         assert x.shape == (10, 11, 10), f"Expected shape (10, 11, 10), got {x.shape}"
         return x
 
